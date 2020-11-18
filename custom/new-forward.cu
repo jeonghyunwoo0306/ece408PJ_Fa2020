@@ -63,9 +63,6 @@ __global__ void conv_forward_kernel(float *y, const float *x, const float *k, co
 
 __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x, const float *host_k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
-    // TODO: Erase this after check Input / Kernel Output size
-    // printf("Input H: %d, W: %d, Kernel Width: %d, # of Output %d, # of Input: %d\n", H, W, K, M, C);
-
     // get_device_properties();
 
     // Declare Related variables
