@@ -60,10 +60,10 @@ __global__ void conv_forward_kernel(float *y, const float *x, const float *k, co
         __syncthreads();
         //printf("All Threads have loaded in the kernel to sharerd mem \n");
         // load tile from globl mem X[n, c,...] into shared memory
-        for (i = h; i < h_base + X_tile_width; i++) {
-            for (j = w; j < w_base + X_tile_width; j++) {
-                if () {
-                    X_shared[(i-h_base)*X_tile_width + (j-w_base)] = x4d(batchId, c, h, w);
+        for (i = h; i < h_base + X_tile_width; i+=TILEWIDTH) {
+            for (j = w; j < w_base + X_tile_width; j+=TILEWIDTH) {
+                if (i < H_out && j < W_out) {
+                    X_shared[(i-h_base)*X_tile_width + (j-w_base)] = x4d(batchId, c, i, j);
                 }
             }
         }
