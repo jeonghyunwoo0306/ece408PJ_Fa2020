@@ -4,92 +4,179 @@
 
 #define TILE_WIDTH 32
 
-__global__ void conv_forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
-{
-    /*
-    Modify this function to implement the forward pass described in Chapter 16.
-    We have added an additional dimension to the tensors to support an entire mini-batch
-    The goal here is to be correct AND fast.
+// #define KERNEL_WIDTH 7 
 
-    Function paramter definitions:
-    y - output
-    x - input
-    k - kernel
-    B - batch_size (number of images in x)
-    M - number of output feature maps
-    C - number of input feature maps
-    H - input height dimension
-    W - input width dimension
-    K - kernel height and width (K x K)
-    */
+// __constant__ float Weights[4096];
 
-    const int H_out = H - K + 1;
+__global__ void unroll_input(float *x_unroll, const float *x, const int C, const int H, const int W, const int K, int base){
+    
     const int W_out = W - K + 1;
+    const int H_out = H - K + 1;
+    
+    int t = blockDim.x * blockIdx.x + threadIdx.x;
 
-    // We have some nice #defs for you below to simplify indexing. Feel free to use them, or create your own.
-    // An example use of these macros:
-    // float a = y4d(0,0,0,0)
-    // y4d(0,0,0,0) = a
+    const int W_unroll = H_out * W_out;
 
-#define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
-#define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
-#define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+    int c, s, h_out, w_out, h_unroll, w_base, w_unroll;
 
-    // Insert your GPU convolution kernel code here
-    int W_grid = ceil(W_out/(1.0*TILE_WIDTH));
-
-    int b = blockIdx.x;
-    int m = blockIdx.y;
-    int h = (blockIdx.z / W_grid) * TILE_WIDTH + threadIdx.y;
-    int w = (blockIdx.z % W_grid) * TILE_WIDTH + threadIdx.x;
-
-    float sum = 0.0;
-
-    for (int c = 0; c < C ; c++) {
-        for (int p = 0; p < K; p++) {
-            for (int q = 0; q < K; q ++) {
-                sum += x4d(b, c, h + p, w + q) * k4d(m, c, p, q);
+    if(t < C * W_unroll){
+        c = t / W_unroll;
+        s = t % W_unroll;
+        h_out = s / W_out;
+        w_out = s % W_out;
+        h_unroll = h_out * W_out + w_out;
+        w_base = c * K * K;
+        for ( int p =0; p < K; p++){
+            for ( int q =0; q < K; q++){
+                w_unroll = w_base + p*K + q;
+                x_unroll[h_unroll * (H_out * W_out) + w_unroll] = x[base + c * (W * H) + (h_out + p) * W + w_out + q];
             }
         }
     }
-   if((h < H_out) && (w < W_out))
-        y4d(b, m, h, w) = sum;
-    
+}
 
-#undef y4d
-#undef x4d
-#undef k4d
+__global__ void unroll_weights(float *k_unroll, float *k, const int M, const int C, const int K){
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if(t< (M*C)){
+        int m = t / C;
+        int c = t % C;
+        int h_base = c * K * K;
+        int unroll_width = C * K * K;
+
+        for(int p=0; p < K; p++){
+            for (int q=0; q < K; q++){
+                int h_unroll = h_base + p*K + q;
+                k_unroll[m * unroll_width + w * w_base + p * K + q] = k[m*K*K*C + c*K*K + p*K + q];
+            }
+        }
+    }
+}
+
+// Simple shared Matmul kernel 
+__global__ void matrixMultiplyShared(float *A, float *B, float *C,
+    int numARows, int numAColumns,
+    int numBRows, int numBColumns,
+    int numCRows, int numCColumns) {
+
+    __shared__ float subTileA[TILE_WIDTH][TILE_WIDTH];
+    __shared__ float subTileB[TILE_WIDTH][TILE_WIDTH];
+
+    int bx=blockIdx.x; 
+    int by=blockIdx.y;
+
+    int tx=threadIdx.x;
+    int ty=threadIdx.y;
+
+    int Row = by * TILE_WIDTH + ty;
+    int Col = bx * TILE_WIDTH + tx;
+
+    float Pvalue = 0.0;
+
+    for (int q=0; q < (numAColumns-1)/TILE_WIDTH +1 ; q++){
+    if((Row < numARows) && ((q*TILE_WIDTH+tx) < numAColumns))
+        subTileA[ty][tx] = A[Row*numAColumns+(q*TILE_WIDTH+tx)];
+    else
+        subTileA[ty][tx] = 0.0;
+    if(((q*TILE_WIDTH+ty) < numBRows) && (Col < numBColumns))
+        subTileB[ty][tx] = B[(q*TILE_WIDTH+ty)*numBColumns+Col];
+    else
+        subTileB[ty][tx] = 0.0;
+
+    __syncthreads();
+    for (int k = 0; k < TILE_WIDTH; k++)
+        Pvalue += subTileA[ty][k] * subTileB[k][tx];
+    __syncthreads();
+
+    if((Row < numCRows) && (Col < numCColumns))
+        C[Row*numCColumns+Col] = Pvalue;
+    }
+}
+
+__global__ void reshpae_outputs(float *y, float *y_matmul, const int M, const int H, const int W, const int K, int base){
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+
+    const int W_out = W - K + 1;
+    const int H_out = H - K + 1;
+
+    if(t< (M * W_out * H_out)){
+        int h = t / (W_out * H_out);
+        int w = t % (W_out * H_out);
+    }
+
+    y[base + w * H + h] = y_matmul[h * (W_out * H_out) + w];
 }
 
 __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x, const float *host_k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
-    // get_device_properties();
-
     // Declare Related variables
     const int H_out = H - K + 1;
     const int W_out = W - K + 1;
 
-    const int W_grid = ceil(W_out/(1.0*TILE_WIDTH));
-    const int H_grid = ceil(H_out/(1.0*TILE_WIDTH));
-    const int Z_grid = W_grid * H_grid;
+    // TODO: erase this after double check
+    // const int W_grid = ceil(W_out/(1.0*TILE_WIDTH));
+    // const int H_grid = ceil(H_out/(1.0*TILE_WIDTH));
+    // const int Z_grid = W_grid * H_grid;
 
     // Declare relevant device pointers
     float *device_x;
     float *device_y;
     float *device_k;
 
+    float *device_unroll_x;
+    float *device_unroll_k;
+    float *device_unroll_y;
+
     // Allocate memory and copy over the relevant data structures to the GPU
     cudaMalloc((void **) &device_x, (H * W * C * B) * sizeof(float));
     cudaMalloc((void **) &device_y, (H_out * W_out * M * B) * sizeof(float));
     cudaMalloc((void **) &device_k, (K * K * M * C) * sizeof(float));
 
+    // Allocate memory for unrolled input & Weights
+    cudaMalloc((void **) &device_unroll_x, (H_out * W_out * K * K * C) * sizeof(float));
+    cudaMalloc((void **) &device_unroll_k, (K * K * C * M) * sizeof(float));
+    cudaMalloc((void **) &device_unroll_y, (H_out * W_out * M) * sizeof(float));
+
+
+
+    // Copy input & weights to Device
     cudaMemcpy(device_x, host_x, H * W * C * B * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(device_k, host_k, K * K * M * C * sizeof(float), cudaMemcpyHostToDevice);
 
-    // Set the kernel dimensions and call the kernel
-    dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
-    dim3 gridDim(B, M, Z_grid);
-    conv_forward_kernel<<<gridDim, blockDim>>>(device_y, device_x, device_k, B, M, C, H, W, K);
+    // cudaMemcpyToSymbol(Weights, host_k, (K * K * M * C) * sizeof(float));
+
+
+    // Set the kernel dimensions and call the kernel TODO: Change this
+    dim3 DimGridUnrollX = (C * H_out * W_out, 1, 1);
+    dim3 DimBlockUnrollX = (ceil((C * H_out * W_out)/(1024.0)), 1, 1); // 1024: MAX_NUM_THREADS in per block
+
+    dim3 DimGridUnrollK = (C * M, 1, 1);
+    dim3 DimBlockUnrollK = (ceil((C * M)/(1024.0)), 1, 1);
+
+    dim3 DimGridMatmul = (ceil((W_out * H_out)/(1.0*TILE_WIDTH)), ceil(M/(1.0*TILE_WIDTH)), 1);
+    dim3 DimBlockMatmul = (TILE_WIDTH, TILE_WIDTH, 1);
+
+    dim3 DimGridReshape = (M * W_out * H_out, 1, 1);
+    dim3 DimBlockReshape = (ceil((M * W_out * H_out)/(1024.0)), 1, 1)
+    //Launch weigths unroll kernel here
+    unroll_weights<<<DimGridUnrollK, DimBlockUnrollK>>> (device_unroll_k, device_k, M, C, K);
+
+    for(int i = 0; i < B; i++) {
+        // Declare base index for input & Output
+        int baseX = i * W * H * C;
+
+        int baseY = i * W_out * H_out * M;
+
+        // Launch input unroll kernel here
+        unroll_input<<<DimGridUnrollX, DimBlockUnrollX>>>(device_unroll_x, device_x, C, H, W, K, baseX);
+
+        // Do tiled matrix multiplication here
+        matrixMultiplyShared<<<DimGridMatmul, DimBlockMatmul>>>(device_unroll_k, device_unroll_x, device_unroll_y, M, (K * C * C), (K * C * C), (W_out * H_out), (M), (W_out*H_out));
+
+        // Launch kernel which reshape output from Matmul to orignal shape
+        reshpae_outputs<<<DimGridReshape, DimBlockReshape>>>(device_y, device_unroll_y, M, H, W, K, baseY);
+
+    }
 
     // Copy the output back to host
     cudaMemcpy(host_y, device_y, (H_out * W_out * M * B) * sizeof(float), cudaMemcpyDeviceToHost);
@@ -97,6 +184,10 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
     cudaFree(device_x);
     cudaFree(device_y);
     cudaFree(device_k);
+    cudaFree(device_unroll_x);
+    cudaFree(device_unroll_k);
+    cudaFree(device_unroll_y);
+
     // Useful snippet for error checking
     // cudaError_t error = cudaGetLastError();
     // if(error != cudaSuccess)
