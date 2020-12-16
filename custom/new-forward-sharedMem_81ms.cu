@@ -3,7 +3,13 @@
 #include "gpu-new-forward.h"
 #include <cuda_fp16.h>
 
+#define MASK_WIDTH 7
+#define MAX_CHANNELS 4
 #define TILEWIDTH 16
+#define MAX_FEATURE_MAPS 16
+#define SM TILEWIDTH+MASK_WIDTH-1
+
+__constant__ float Weights[4096];
 
 __global__ void conv_forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
@@ -24,39 +30,61 @@ __global__ void conv_forward_kernel(float *y, const float *x, const float *k, co
     K - kernel height and width (K x K)
     */
 
-    const int H_out = H - K + 1;
-    const int W_out = W - K + 1;
+    const int H_out = H - MASK_WIDTH + 1;
+    const int W_out = W - MASK_WIDTH + 1;
+    
 
     #define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
     #define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
-    #define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+    #define k4d(i3, i2, i1, i0) Weights[(i3) * (C * MASK_WIDTH * MASK_WIDTH) + (i2) * (MASK_WIDTH * MASK_WIDTH) + (i1) * (MASK_WIDTH) + i0]
 
-    int W_grid = ceil(W/(TILEWIDTH*1.0));
-    int batchId = blockIdx.x;
-    int m = blockIdx.y;
-    int h = (blockIdx.z / W_grid) * TILEWIDTH + threadIdx.y;
-    int w = (blockIdx.z % W_grid) * TILEWIDTH + threadIdx.x;
-   
-    float Pvalue = 0.0f;
-    half PvalueHalf = __float2half(Pvalue);
-    for(int c = 0; c < C; c++) { //iterate through channels
-        for(int p = 0; p < K; p++) {
-            for(int q = 0; q < K; q++) {
-                half xin = __float2half(x4d(batchId, c, h+p, w+q));
-                half kin = __float2half(k4d(m,c, p, q));
-                #if __CUDA_ARCH__ >= 530
-                    PvalueHalf += __hmul(xin, kin);
-                #else
-                PvalueHalf += __float2half(x4d(batchId, c, h+p, w+q) * k4d(m,c, p, q));
-                #endif
-                //Pvalue += x4d(batchId, c, h+p, w+q) * k4d(m,c, p, q);
-            }
+
+    // make the input shared memory only the size of input tile (TILEWIDTH+MASK_WIDTH-1)^2) * number of channels...
+    __shared__ float sharedInput[MAX_CHANNELS*(SM)*(SM)];
+
+    //__shared__ float sharedWeights[(MASK_WIDTH*MASK_WIDTH)];
+
+    int w = threadIdx.x;
+    int h = threadIdx.y;
+
+    int batch = blockIdx.z;
+    int input_x = w + blockIdx.x*TILEWIDTH;
+    int input_y = h + blockIdx.y*TILEWIDTH;
+    int input_z = threadIdx.z + batch;
+
+    int c;
+    for (c = 0; c < C; c++) {
+        int index = (c*(SM)*(SM)) + (h*(SM)) + (w);
+        if (input_z < B && input_y < H && input_x < W) {
+            sharedInput[index] = x4d(input_z, c, input_y, input_x);
+        } else {
+            sharedInput[index] = 0.0;
         }
     }
-
-    if (h < H_out && w < W_out) {
-        y4d(batchId, m, h, w) = __half2float(PvalueHalf);
-        //y4d(batchId, m, h, w) = Pvalue;
+    __syncthreads();
+    if ((h < TILEWIDTH) && (w < TILEWIDTH)){ 
+        for (int m = 0; m < M; m++){    
+            float Pvalue = 0.0f;
+            for (int c = 0; c < C; c++){ 
+                // if (w < K && h < K) {
+                //     int w_index = (h*(K)) + (w);
+                //     sharedWeights[w_index] = k4d(m, c, h, w);
+                // }   
+                __syncthreads();
+                // Loop through 2D convolution kernel/filter
+                for (int ky = 0; ky < MASK_WIDTH; ky++){
+                    for (int kx = 0; kx < MASK_WIDTH; kx++){
+                        int index = (c*(SM)*(SM)) + ((h+ky)*(SM)) + (w+kx);
+                        int w_index = (ky*MASK_WIDTH) + (kx);
+                        Pvalue += k4d(m, c, ky, kx) * sharedInput[index];   // do convolution
+                        //Pvalue += sharedWeights[w_index] * sharedInput[index];
+                    }
+                }
+            }
+            if ((input_x < W_out) && (input_y < H_out) && (input_z < B)){  // if thread is within output bounds
+                y4d(input_z, m, input_y, input_x) = Pvalue;  // set convolution result
+            }
+        }
     }
 
     #undef y4d
@@ -72,14 +100,14 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
     float *deviceOutput;
     float *deviceKernel;    
 
-    const int H_out = H - K + 1;
-    const int W_out = W - K + 1;
+    const int H_out = H - MASK_WIDTH + 1;
+    const int W_out = W - MASK_WIDTH + 1;
 
     // Allocate memory and copy over the relevant data structures to the GPU
     std::cout<<"Allocating Memory.. "<<std::endl;
     cudaMalloc((void**)&deviceInput,(H*W*C*B)*sizeof(float));
     cudaMalloc((void**)&deviceOutput,(H_out*W_out*M*B)*sizeof(float));
-    cudaMalloc((void**)&deviceKernel,(K*K*M*C)*sizeof(float));
+    cudaMalloc((void**)&deviceKernel,(MASK_WIDTH*MASK_WIDTH*M*C)*sizeof(float));
     // cudaError_t error = cudaGetLastError();
     // if(error != cudaSuccess)
     // {
@@ -91,7 +119,7 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
     // std::cout<<"Input Width:  "<< W <<std::endl;
     std::cout<<"Copying memory from host to device.. "<<std::endl;
     cudaMemcpy(deviceInput, &host_x[0], (H*W*C*B)*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(deviceKernel, &host_k[0], (K*K*M*C)*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(deviceKernel, &host_k[0], (MASK_WIDTH*MASK_WIDTH*M*C)*sizeof(float), cudaMemcpyHostToDevice);
     // error = cudaGetLastError();
     // if(error != cudaSuccess)
     // {
@@ -104,13 +132,30 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
     int W_grid = ceil(W/(TILEWIDTH*1.0));
     int H_grid = ceil(H/(TILEWIDTH*1.0));
     int Z = W_grid*H_grid;
-    dim3 dimBlock(TILEWIDTH, TILEWIDTH, 1);
-    dim3 dimGrid(B,M,Z);
+    //  launching as many threads as we need to load an input tile 
+    // (as opposed to computing an output tile)
+    //dim3 dimBlock(TILEWIDTH + K-1, TILEWIDTH+K-1, 1);
+
+    cudaMemcpyToSymbol(Weights, host_k, (MASK_WIDTH * MASK_WIDTH * M * C) * sizeof(float));
+    
+    dim3 dimBlock(SM, SM, 1);
+    //dim3 dimBlock(TILEWIDTH, TILEWIDTH, 1);
+    dim3 dimGrid(ceil((1.0*W_out)/(1.0*TILEWIDTH)), ceil((1.0*H_out)/(1.0*TILEWIDTH)), B);
+    //dim3 dimGrid(B,M,Z);
 
     //@@ Launch the GPU kernel here
     std::cout<<"Launching Kernel "<<std::endl;
-    size_t shmem_size = sizeof(float) * ((TILEWIDTH + K-1)*(TILEWIDTH + K-1) + K*K );
-    conv_forward_kernel<<<dimGrid, dimBlock, shmem_size>>>(deviceOutput, deviceInput, deviceKernel, B, M, C, H, W, K);
+    std::cout<<"B:      "<<B<<std::endl;
+    std::cout<<"M:      "<<M<<std::endl;
+    std::cout<<"C:      "<<C<<std::endl;
+    std::cout<<"H:      "<<H<<std::endl;
+    std::cout<<"W:      "<<W<<std::endl;
+    std::cout<<"K:      "<<K<<std::endl;
+    std::cout<<"Launching Kernel with block dim: "<< SM <<std::endl;
+    // transitioning to useing output tile size..
+   // size_t shmem_size = sizeof(float) * ( (TILEWIDTH + K-1)*(TILEWIDTH + K-1)+ K*K );
+   //size_t shmem_size = sizeof(float) * (MASK_WIDTH*MASK_WIDTH);
+    conv_forward_kernel<<<dimGrid, dimBlock, 0>>>(deviceOutput, deviceInput, deviceKernel, B, M, C, H, W, K);
     // Useful snippet for error checking
     cudaError_t error = cudaGetLastError();
     error = cudaGetLastError();
