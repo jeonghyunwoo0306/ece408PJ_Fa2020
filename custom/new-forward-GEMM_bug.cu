@@ -173,9 +173,8 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
 
         // Launch input unroll kernel here
         unroll_input<<<DimGridUnrollX, DimBlockUnrollX>>>(device_unroll_x, device_x, C, H, W, K, baseX);
-
         // Do tiled matrix multiplication here
-        matrixMultiplyShared<<<DimGridMatmul, DimBlockMatmul>>>(device_unroll_k, device_unroll_x, device_unroll_y, M, (K * K * C), (K * K * C), (W_out * H_out), (M), (W_out*H_out));
+        matrixMultiplyShared<<<DimGridMatmul, DimBlockMatmul>>>(device_unroll_k, device_unroll_x, device_unroll_y, M, (K * C * C), (K * C * C), (W_out * H_out), (M), (W_out*H_out));
         // Launch kernel which reshape output from Matmul to orignal shape
         reshpae_outputs<<<DimGridReshape, DimBlockReshape>>>(device_y, device_unroll_y, M, H, W, K, baseY);
     }
